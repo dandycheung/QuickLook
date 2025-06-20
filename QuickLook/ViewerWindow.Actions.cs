@@ -38,7 +38,7 @@ public partial class ViewerWindow
 
         try
         {
-            Process.Start(new ProcessStartInfo(_path)
+            using var _ = Process.Start(new ProcessStartInfo(_path)
             {
                 WorkingDirectory = Path.GetDirectoryName(_path)
             });
@@ -160,6 +160,13 @@ public partial class ViewerWindow
             Debug.WriteLine(e);
         }
 
+        if (_autoReloadWatcher != null)
+        {
+            _autoReloadWatcher.EnableRaisingEvents = false;
+            _autoReloadWatcher.Dispose();
+            _autoReloadWatcher = null;
+        }
+
         Plugin = null;
 
         _path = string.Empty;
@@ -205,28 +212,38 @@ public partial class ViewerWindow
 
         PositionWindow(newSize);
 
-        if (Visibility != Visibility.Visible)
+        if (!IsVisible)
         {
             Dispatcher.BeginInvoke(new Action(() => this.BringToFront(Topmost)), DispatcherPriority.Render);
             Show();
         }
 
-        //ShowWindowCaptionContainer(null, null);
-        //WindowHelper.SetActivate(new WindowInteropHelper(this), ContextObject.CanFocus);
+        if (_autoReload && File.Exists(path))
+        {
+            _autoReloadWatcher?.Dispose();
+            _autoReloadWatcher = new FileSystemWatcher(Path.GetDirectoryName(path), Path.GetFileName(path))
+            {
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size,
+            };
+            _autoReloadWatcher.Changed += (_, _) =>
+                // Executed asynchronously to avoid deadlock
+                Dispatcher.BeginInvoke(() => ViewWindowManager.GetInstance().ReloadPreview());
+            _autoReloadWatcher.EnableRaisingEvents = true;
+        }
 
         // load plugin, do not block UI
         Dispatcher.BeginInvoke(new Action(() =>
+        {
+            try
             {
-                try
-                {
-                    Plugin.View(path, ContextObject);
-                }
-                catch (Exception e)
-                {
-                    exceptionHandler(path, ExceptionDispatchInfo.Capture(e));
-                }
-            }),
-            DispatcherPriority.Input);
+                Plugin.View(path, ContextObject);
+            }
+            catch (Exception e)
+            {
+                exceptionHandler(path, ExceptionDispatchInfo.Capture(e));
+            }
+        }),
+        DispatcherPriority.Input);
     }
 
     private void SetOpenWithButtonAndPath()
