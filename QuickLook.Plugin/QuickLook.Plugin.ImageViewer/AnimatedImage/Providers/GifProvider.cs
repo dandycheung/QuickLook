@@ -49,7 +49,8 @@ internal class GifProvider : AnimationProvider
     private readonly int _maxLoopCount = 0; // 0 - infinite loop
     private int _loopIndex = 0;
 
-    private TimeSpan _minTickTimeInMillisecond = TimeSpan.FromMilliseconds(20);
+    private readonly TimeSpan _minTickTimeInMillisecond = TimeSpan.FromMilliseconds(20);
+    private readonly object _syncRoot = new();
 
     public GifProvider(Uri path, MetaProvider meta, ContextObject contextObject) : base(path, meta, contextObject)
     {
@@ -96,13 +97,15 @@ internal class GifProvider : AnimationProvider
 
         try
         {
-            lock (_bitmap ?? new object()) // Lock to prevent null reference exception
+            lock (_syncRoot)
             {
                 _bitmap?.Dispose();
                 _bitmap = null;
 
                 _stream?.Dispose();
                 _stream = null;
+
+                _frameDelays = null;
             }
         }
         catch (Exception e)
@@ -111,7 +114,6 @@ internal class GifProvider : AnimationProvider
         }
 
         _frame = null;
-        _frameDelays = null;
     }
 
     public override Task<BitmapSource> GetThumbnail(Size renderSize)
@@ -121,8 +123,14 @@ internal class GifProvider : AnimationProvider
 
         return new Task<BitmapSource>(() =>
         {
-            _frame = _bitmap.ToBitmapSource();
-            return _frame;
+            lock (_syncRoot)
+            {
+                if (_bitmap == null)
+                    return _frame;
+
+                _frame = _bitmap.ToBitmapSource();
+                return _frame;
+            }
         });
     }
 
@@ -168,9 +176,17 @@ internal class GifProvider : AnimationProvider
         return _minTickTimeInMillisecond;
     }
 
-    private TimeSpan GetFrameDelay(int frameIndex)
+    private bool TryGetFrameDelay(int frameIndex, out TimeSpan delay)
     {
-        return TimeSpan.FromMilliseconds(_frameDelays[frameIndex]);
+        var delays = _frameDelays;
+        if (delays == null || frameIndex < 0 || frameIndex >= delays.Length)
+        {
+            delay = default;
+            return false;
+        }
+
+        delay = TimeSpan.FromMilliseconds(delays[frameIndex]);
+        return true;
     }
 
     /// <summary>
@@ -178,17 +194,22 @@ internal class GifProvider : AnimationProvider
     /// </summary>
     private void HandleThreadHeartBeatTicked()
     {
-        var initSleepTime = GetSleepAmountInMilliseconds(GetFrameDelay(_frameIndex));
-        Thread.Sleep(initSleepTime);
+        if (!TryGetFrameDelay(_frameIndex, out var initDelay))
+            return;
+
+        Thread.Sleep(GetSleepAmountInMilliseconds(initDelay));
 
         while (_isPlaying)
         {
             try
             {
-                UpdateFrame(_frameIndex);
+                if (!UpdateFrame(_frameIndex))
+                    return;
 
-                var sleepTime = GetSleepAmountInMilliseconds(GetFrameDelay(_frameIndex));
-                Thread.Sleep(sleepTime);
+                if (!TryGetFrameDelay(_frameIndex, out var frameDelay))
+                    return;
+
+                Thread.Sleep(GetSleepAmountInMilliseconds(frameDelay));
             }
             catch (ArgumentException)
             {
@@ -202,10 +223,18 @@ internal class GifProvider : AnimationProvider
             {
                 // ignore
             }
+            catch (ObjectDisposedException)
+            {
+                // image was disposed while updating frames
+                return;
+            }
             catch (InvalidOperationException)
             {
                 // ignore
             }
+
+            if (!_isPlaying)
+                return;
 
             _frameIndex++;
             if (_frameIndex >= _frameCount)
@@ -222,12 +251,16 @@ internal class GifProvider : AnimationProvider
         }
     }
 
-    private void UpdateFrame(int frameIndex)
+    private bool UpdateFrame(int frameIndex)
     {
-        lock (_bitmap)
+        lock (_syncRoot)
         {
+            if (_bitmap == null)
+                return false;
+
             _bitmap.SetActiveTimeFrame(frameIndex);
             _frame = _bitmap.ToBitmapSource();
+            return true;
         }
     }
 }
